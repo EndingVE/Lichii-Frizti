@@ -1,0 +1,172 @@
+name: windows-patched
+
+# Fork-only workflow: Windows x64 MSVC build on a standard GitHub-hosted runner. No release,
+# no tag, no secrets, no signing. Steps copied from release-binaries.yml (windows-x86_64 only).
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/pipeline-evict-budget
+    paths:
+      - ".github/workflows/windows-patched.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: windows-x86_64 binary (patched)
+    timeout-minutes: 300
+    runs-on: windows-2022
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3000M
+      CCACHE_COMPILERCHECK: content
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_CACHE_SIZE: 3G
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            runner: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up MSVC
+        if: matrix.platform == 'windows-x86_64'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Qt on Windows
+        if: matrix.platform == 'windows-x86_64'
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      # MSVC is not something ccache handles well, so that job uses sccache. The other jobs use
+      # ccache, which CMake enables through USE_CCACHE (externals/cmake-modules/UseCcache.cmake).
+      - name: Install sccache on Windows
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'sccache.zip'
+          Invoke-WebRequest -OutFile $zip https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-pc-windows-msvc.zip
+          Expand-Archive $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'sccache')
+          $bin = (Get-ChildItem -Recurse -Filter sccache.exe (Join-Path $env:RUNNER_TEMP 'sccache')).DirectoryName
+          $bin | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install Vulkan SDK on Windows
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Verify Vulkan tools on Windows
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: glslangValidator --version
+
+      # Eden builds its Windows PGO binaries with MSYS2's clang toolchain, so we do the same. The
+      # package list is docs/Deps.md (MSYS2) plus what the bundled FFmpeg needs to compile.
+      - name: Restore CPM downloads
+        id: cpm-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .cache/cpm
+          key: cpm-${{ matrix.platform }}-v2-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: |
+            cpm-${{ matrix.platform }}-v2-
+            cpm-${{ runner.os }}-
+
+      - name: Restore compiler objects
+        id: compiler-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            .ccache
+            .sccache
+          key: objects-${{ matrix.platform }}-v2-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            objects-${{ matrix.platform }}-v2-${{ github.sha }}-
+            objects-${{ matrix.platform }}-v2-
+
+      - name: Configure Windows
+        if: matrix.platform == 'windows-x86_64'
+        shell: bash
+        run: >-
+          cmake -S . -B build/release -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=OFF
+          -DYUZU_TESTS=OFF
+          -DYUZU_CMD=ON
+          -DYUZU_ROOM=OFF
+          -DYUZU_ROOM_STANDALONE=OFF
+          -DYUZU_USE_BUNDLED_QT=OFF
+          -DYUZU_USE_BUNDLED_SDL3=ON
+          -DENABLE_UPDATE_CHECKER=OFF
+          -DLICHII_BUILD_TAG=build-${{ github.run_number }}
+          -DLICHII_BUILD_PLATFORM=${{ matrix.platform }}
+          -DUSE_DISCORD_PRESENCE=OFF
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Save CPM downloads
+        if: steps.cpm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: .cache/cpm
+          key: ${{ steps.cpm-cache.outputs.cache-primary-key }}
+
+      - name: Build
+        if: ${{ ! matrix.mingw }}
+        shell: bash
+        run: |
+          if command -v ccache > /dev/null; then ccache --zero-stats; else sccache --zero-stats; fi
+          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          if command -v ccache > /dev/null; then ccache --show-stats; else sccache --show-stats; fi
+
+      - name: Stop sccache on Windows
+        if: always() && matrix.platform == 'windows-x86_64' && steps.compiler-cache.outcome == 'success'
+        shell: pwsh
+        run: sccache --stop-server
+
+      - name: Save compiler objects
+        if: always() && steps.compiler-cache.outcome == 'success'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            .ccache
+            .sccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      # Plain tar.gz with the two programs. GitHub artifacts drop the executable bit, so a tar is
+      # what keeps it. This one is not self-contained: it needs Qt 6 and the usual libraries
+      # installed on the system.
+      - name: Package Windows binary
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          foreach ($exe in 'lichii.exe', 'eden-cli.exe') {
+            if (-not (Test-Path "build/release/bin/$exe")) {
+              throw "build/release/bin/$exe was not produced"
+            }
+          }
+          windeployqt --release --no-translations build/release/bin/lichii.exe
+
+      # A dynamic MinGW build is not portable on its own: windeployqt6 brings the Qt libraries and
+      # plugins, then every non-system DLL the binaries and those plugins pull in gets copied next to
+      # them (docs/Caveats.md#msys2).
+      - name: Upload Windows binary
+        if: matrix.platform == 'windows-x86_64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: lichii-${{ matrix.platform }}-${{ github.sha }}
+          path: build/release/bin/
+          if-no-files-found: error
+          retention-days: 7
+
