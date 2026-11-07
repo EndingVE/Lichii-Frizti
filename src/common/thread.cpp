@@ -762,6 +762,24 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
                               std::chrono::steady_clock::now().time_since_epoch());
     };
     const u64 ticks_per_second = Common::g_wall_clock.NsToTicks(std::chrono::seconds{1});
+    // UMWAIT/MWAITX keep the logical processor occupied for the whole wait (the host timing
+    // thread showed 98% of a P core while it only waited for the next event). Sleep in the OS for
+    // all but the last `margin` of a long wait and finish with the instruction, as before.
+    // EDEN_NX2_TIMING_SLEEP_US=<margin in us> (default 2500); 0 keeps the instruction for all of it.
+    static const std::chrono::nanoseconds sleep_margin = [] {
+        const char* value = std::getenv("EDEN_NX2_TIMING_SLEEP_US");
+        const long us = value != nullptr ? std::strtol(value, nullptr, 10) : 2500;
+        return std::chrono::microseconds{us > 0 ? us : 0};
+    }();
+    if (sleep_margin.count() > 0 && remaining() > sleep_margin + std::chrono::microseconds{500}) {
+        std::unique_lock lk{mutex};
+        condvar.wait_for(lk, remaining() - sleep_margin, [this] { return is_set.load(); });
+        lk.unlock();
+        bool expected = true;
+        if (is_set.compare_exchange_strong(expected, false, std::memory_order_release)) {
+            return true;
+        }
+    }
     if (caps.monitorx) {
         while (true) {
             // Armed monitor, as per manual, MWAITX must be conditional if the condition isn't satisfied
