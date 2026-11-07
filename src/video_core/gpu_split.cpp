@@ -146,7 +146,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');
     LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}",
              front_macros ? ", macros on the first" : "");
-    LOG_INFO(HW_GPU, "Nx2Fase2 t2 split spins: front {}, back {} pauses before sleeping",
+    LOG_INFO(HW_GPU, "Nx2Fase2 t3 (upstream 9fa4a71f) split spins: front {}, back {} pauses before sleeping",
              FrontSpins(), BackSpins());
 }
 
