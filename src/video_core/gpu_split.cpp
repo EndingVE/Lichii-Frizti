@@ -47,6 +47,30 @@ void Pause() {
 
 [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
 
+// How long each side spins (pause instructions) before it sleeps on the other. A sleeper pays
+// the wake-up latency of the OS (tens of microseconds, more on a hybrid CPU) while its partner
+// idles. The front waits ~10,000 times a second for the back to catch up; the back waits for
+// the front just as often. EDEN_NX2_SPLIT_FRONT_SPINS / EDEN_NX2_SPLIT_BACK_SPINS (before this
+// change: 16384 and 8192); read when first used, so nx2_switches.txt reaches them.
+u32 SpinLimit(const char* name, u32 fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return fallback;
+    }
+    const long parsed = std::strtol(value, nullptr, 10);
+    return parsed > 0 ? static_cast<u32>(parsed) : fallback;
+}
+
+u32 FrontSpins() {
+    static const u32 limit = SpinLimit("EDEN_NX2_SPLIT_FRONT_SPINS", 65536);
+    return limit;
+}
+
+u32 BackSpins() {
+    static const u32 limit = SpinLimit("EDEN_NX2_SPLIT_BACK_SPINS", 32768);
+    return limit;
+}
+
 } // Anonymous namespace
 
 void GpuSplit::CheckOwner(const char* where) {
@@ -122,6 +146,8 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');
     LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}",
              front_macros ? ", macros on the first" : "");
+    LOG_INFO(HW_GPU, "Nx2Fase2 t2 split spins: front {}, back {} pauses before sleeping",
+             FrontSpins(), BackSpins());
 }
 
 void GpuSplit::Stop() {
@@ -247,7 +273,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
 }
 
 void GpuSplit::Backoff(u32 spins, u64 target) {
-    if (spins < 16384) {
+    if (spins < FrontSpins()) {
         Pause();
         return;
     }
@@ -423,7 +449,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             // The front usually sends more within microseconds: spin briefly before sleeping.
-            for (u32 spins = 0; spins < 8192 && available == read_position &&
+            const u32 back_spins = BackSpins();
+            for (u32 spins = 0; spins < back_spins && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
                  ++spins) {
                 Pause();
