@@ -115,8 +115,12 @@ add_library(video_core STATIC
     native_query_trace.h
     nx2.h
     nx2_cmdpage_diag.h
+    nx2_census.cpp
+    nx2_census.h
     nx2_debug_control.cpp
     nx2_debug_control.h
+    nx2_env.cpp
+    nx2_env.h
     nx2_profile.h
     nx2_perf.h
     nx2_download_trace.h

@@ -7,6 +7,7 @@
 #include "common/fs/path_util.h"
 #include "nx2_switches.h"
 #include "startup_checks.h"
+#include "video_core/nx2_env.h"
 
 #if YUZU_ROOM
 #include <cstring>
@@ -83,6 +84,7 @@ static Qt::HighDpiScaleFactorRoundingPolicy GetHighDpiRoundingPolicy() {
 
 int main(int argc, char* argv[]) {
     LoadNx2Switches(argv[0]);
+    VideoCommon::ReloadEnvSwitches();
 #if YUZU_ROOM
     bool launch_room = false;
     for (int i = 1; i < argc; i++) {

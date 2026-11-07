@@ -12,11 +12,14 @@
 #endif
 #include <chrono>
 #include <cstdlib>
+#include <atomic>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 
 #include "common/common_types.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_census.h"
 #include "common/logging.h"
 #include "common/cpu_features.h"
 #include "common/thread_cpu_clock.h"
@@ -76,11 +79,28 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "writer wait", "list submit wait", "list GPU wait",
 };
 
-// Read once at startup: Enabled() runs several times per method write (no guard to check).
-inline const bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+// Read by Reload() (main, after nx2_switches.txt is loaded; a namespace-scope getenv ran before
+// the file and ignored it): Enabled() runs several times per method write (no guard to check).
+// EDEN_NX2_GPU_PROFILE=1 (any value): every zone, including one per engine method and the
+// slow per-method path. =2 or =lite: all zones except the per-method one, and the engines keep
+// their production fast path (Maxwell3D fast_maxwell3d), so the figures are those of a normal run.
+inline bool g_enabled = false;
+inline bool g_full = false;
+
+inline void Reload() {
+    const char* value = std::getenv("EDEN_NX2_GPU_PROFILE");
+    g_enabled = value != nullptr;
+    const bool lite = value != nullptr && (value[0] == '2' || value[0] == 'l' || value[0] == 'L');
+    g_full = g_enabled && !lite;
+}
 
 inline bool Enabled() {
     return g_enabled;
+}
+
+/// Profiling every engine method (the slow path): off in lite mode.
+inline bool Full() {
+    return g_full;
 }
 
 // Nanoseconds; from the host's own counter where the wall clock reads it directly (the zones
@@ -110,13 +130,15 @@ struct ThreadData {
     u64 window_start{};
     u64 window_start_ticks{};
     std::optional<u64> cpu_start_ns;
+    std::array<u32, 64> core_samples{}; ///< Logical processor this thread was seen on
+    u32 report_calls{};
 };
 
 inline thread_local ThreadData t_data;
 
 class Scope {
 public:
-    explicit Scope(Zone zone_) : zone{zone_}, enabled{Enabled()} {
+    explicit Scope(Zone zone_) : zone{zone_}, enabled{zone_ == Zone::Method ? Full() : Enabled()} {
         if (!enabled) {
             return;
         }
@@ -167,7 +189,7 @@ inline thread_local std::array<u32, 0x2000> t_method_same{};
 inline thread_local std::array<u32, 0x2000> t_dma_reads{};
 
 inline void CountMethod(u32 method, bool same) {
-    if (Enabled() && method < t_method_count.size()) {
+    if (Full() && method < t_method_count.size()) {
         ++t_method_count[method];
         t_method_same[method] += same ? 1 : 0;
     }
@@ -233,8 +255,18 @@ inline void Report(const char* thread_name = "GPU thread") {
         return;
     }
     auto& data = t_data;
+    if ((++data.report_calls & 63) == 0) {
+        ++data.core_samples[Nx2Census::CurrentCore() & 63];
+    }
     const u64 now = Now();
     if (data.window_start == 0) {
+        static std::atomic<bool> announced{};
+        if (!announced.exchange(true)) {
+            LOG_INFO(HW_GPU, "Nx2Fase2 profile mode: {} ({}); logical processors by efficiency: {}",
+                     Full() ? "full" : "lite", Full() ? "every method timed, slow path"
+                                                       : "no per-method zone, fast path on",
+                     Nx2Census::Topology());
+        }
         data.window_start = now;
         data.window_start_ticks = Ticks();
         data.cpu_start_ns = Common::CurrentThreadCpuTimeNs();
@@ -296,7 +328,35 @@ inline void Report(const char* thread_name = "GPU thread") {
         line += fmt::format(" | host_cpu_busy_ms_per_s=unavailable window_wall_ms={:.3f}",
                             static_cast<double>(window) / 1e6);
     }
+    {
+        u64 total_samples{};
+        for (const u32 count : data.core_samples) {
+            total_samples += count;
+        }
+        std::array<u32, 64> order;
+        for (u32 i = 0; i < order.size(); ++i) {
+            order[i] = i;
+        }
+        std::partial_sort(order.begin(), order.begin() + 4, order.end(), [&data](u32 a, u32 b) {
+            return data.core_samples[a] > data.core_samples[b];
+        });
+        std::string cores;
+        for (size_t i = 0; i < 4 && data.core_samples[order[i]] != 0; ++i) {
+            cores += fmt::format(" cpu{} {:.0f}%", order[i],
+                                 100.0 * data.core_samples[order[i]] / total_samples);
+        }
+        if (!cores.empty()) {
+            line += " | seen on:" + cores;
+        }
+    }
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
+    if (std::string_view{thread_name} == "GPU back thread") {
+        // The threads that burn the most CPU (a GPU thread spinning on an E core, a guest core
+        // thread with no room): once per window, from the back.
+        if (const std::string threads = Nx2Census::BusiestThreads(window, 14); !threads.empty()) {
+            LOG_INFO(HW_GPU, "Threads, CPU ms per second: {}", threads);
+        }
+    }
     if (const std::string methods = TopMethods(t_method_count, &t_method_same, window); !methods.empty()) {
         LOG_INFO(HW_GPU, "{} methods per second:{}", thread_name, methods);
     }

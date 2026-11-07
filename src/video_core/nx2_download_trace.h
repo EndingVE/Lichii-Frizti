@@ -19,7 +19,11 @@
 // (a Preflushable mark sends later GPU writes over the range to a download at every fence).
 namespace VideoCommon::Nx2DownloadTrace {
 
-inline const bool g_enabled = std::getenv("EDEN_NX2_DOWNLOAD_TRACE") != nullptr;
+inline bool g_enabled = false;
+
+inline void Reload() {
+    g_enabled = std::getenv("EDEN_NX2_DOWNLOAD_TRACE") != nullptr;
+}
 
 struct Totals {
     u64 bytes{};

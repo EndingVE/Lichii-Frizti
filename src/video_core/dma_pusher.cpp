@@ -289,13 +289,17 @@ bool DmaPusher::Step() {
 
 // EDEN_NX2_SEM_WATCH=<gpu address>: log every method whose argument is the low word of an
 // address in the 16 bytes there (finds the engine and method that release a semaphore).
-static const u32 g_semaphore_watch = [] {
-    const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
-    return value ? static_cast<u32>(std::strtoull(value, nullptr, 16)) : 0U;
-}();
+static u32 g_semaphore_watch = 0;
 
 // EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
-static const bool g_record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
+static bool g_record_parsed_entries = false;
+
+// Both are read here, not at static initialisation: nx2_switches.txt loads in main.
+void ReloadDmaPusherSwitches() {
+    const char* watch = std::getenv("EDEN_NX2_SEM_WATCH");
+    g_semaphore_watch = watch ? static_cast<u32>(std::strtoull(watch, nullptr, 16)) : 0U;
+    g_record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
+}
 
 size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
     for (size_t index = 0; index < commands.size();) {

@@ -28,7 +28,11 @@
 // thread logs the counts.
 namespace Tegra::Nx2CmdPageDiag {
 
-inline const bool g_enabled = std::getenv("EDEN_NX2_CMDPAGE_DIAG") != nullptr;
+inline bool g_enabled = false;
+
+inline void Reload() {
+    g_enabled = std::getenv("EDEN_NX2_CMDPAGE_DIAG") != nullptr;
+}
 
 inline constexpr u64 PageBytes = u64{1} << Nx2WrittenPageBits;
 inline constexpr u32 PageWords = static_cast<u32>(PageBytes / sizeof(u32));
