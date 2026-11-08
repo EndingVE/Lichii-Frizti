@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -1351,6 +1352,29 @@ void PipelineCache::TickFrame() {
     }
 }
 
+namespace {
+// Built graphics pipelines kept before unused ones are destroyed. A pipeline destroyed here is
+// rebuilt by the draw that needs it: shader translation on the GPU thread (a few ms, seconds for
+// the biggest Switch 2 programs) plus the driver compile, not only the 2-3 ms of a driver cache
+// hit. Ocarina of Time on an RTX 5070 Ti held ~2,800 pipelines at boot, lost 1,580 of them at the
+// first check and rebuilt ~1,900 in the next 20 minutes. Android keeps the old always-evict rule
+// because of its memory. EDEN_NX2_PIPELINE_RESIDENT_MAX=<n> overrides the limit; 0 evicts always.
+// Read on first use, not at static initialization, so nx2_switches.txt (loaded by main) applies.
+size_t ResidentPipelineLimit() {
+    static const size_t limit = [] {
+        if (const char* value = std::getenv("EDEN_NX2_PIPELINE_RESIDENT_MAX")) {
+            return static_cast<size_t>(std::strtoull(value, nullptr, 10));
+        }
+#ifdef __ANDROID__
+        return size_t{0};
+#else
+        return size_t{6000};
+#endif
+    }();
+    return limit;
+}
+} // Anonymous namespace
+
 void PipelineCache::EvictUnusedPipelines() {
     // Building a pipeline again on MoltenVK means a Metal compile mid-game, far dearer than the
     // 2-3 ms below, so none are evicted there.
@@ -1358,10 +1382,10 @@ void PipelineCache::EvictUnusedPipelines() {
         return;
     }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
-    // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
-    // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
+    // with every place a session went (title 1: 1,500 on its title screen alone). Past the
+    // resident limit, one unused for this long is destroyed.
     constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
+    if (frame_count <= EvictAfterFrames || graphics_cache.size() <= ResidentPipelineLimit()) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
@@ -1887,35 +1911,38 @@ namespace {
 // are logged, and the totals every 10 s, to tell how much of the stutter on new content is
 // translation.
 void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin,
-                           const std::string& shaders) {
+                           const std::string& shaders, bool on_disk = false) {
     static std::chrono::steady_clock::duration total{};
-    static u32 count{}, logged{};
+    static u32 count{}, logged{}, rebuilt{};
     static auto window = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed = now - begin;
     total += elapsed;
     ++count;
+    rebuilt += on_disk ? 1 : 0;
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
     // Slow builds are always logged with their shaders, to find the programs that are slow to
     // translate.
     if (elapsed > std::chrono::milliseconds{100} ||
         (elapsed > std::chrono::milliseconds{2} && logged < 400)) {
         ++logged;
-        LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms: {}", kind,
-                 ms(elapsed), shaders);
+        LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms{}: {}", kind,
+                 ms(elapsed), on_disk ? " (already in the disk cache)" : "", shaders);
     }
     if (now - window > std::chrono::seconds{10}) {
         const auto take = [](auto& counter) {
             return std::chrono::nanoseconds{counter.exchange(0, std::memory_order::relaxed)};
         };
         LOG_INFO(Render_Vulkan,
-                 "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread "
+                 "Runtime pipelines in the last 10 s: {} built ({} already in the disk cache), "
+                 "{:.1f} ms on the GPU thread "
                  "({:.1f} ms of it graphics SPIR-V), {:.1f} ms graphics SPIR-V on workers, "
                  "{:.1f} ms of draws held for unbuilt pipelines",
-                 count, ms(total), ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])),
-                 ms(GraphicsPipeline::TakeHoldTime()));
+                 count, rebuilt, ms(total), ms(take(runtime_spirv_ns[0])),
+                 ms(take(runtime_spirv_ns[1])), ms(GraphicsPipeline::TakeHoldTime()));
         total = {};
         count = 0;
+        rebuilt = 0;
         window = now;
     }
 }
@@ -1923,6 +1950,7 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto begin = std::chrono::steady_clock::now();
+    const bool on_disk = disk_pipelines.contains(graphics_key.Hash());
     SCOPE_EXIT {
         std::string shaders = fmt::format("pipeline={:016x}", graphics_key.Hash());
         for (size_t stage = 0; stage < graphics_key.unique_hashes.size(); ++stage) {
@@ -1930,7 +1958,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
                 shaders += fmt::format(" s{}:{:016x}", stage, graphics_key.unique_hashes[stage]);
             }
         }
-        ReportRuntimePipeline("Graphics", begin, shaders);
+        ReportRuntimePipeline("Graphics", begin, shaders, on_disk);
     };
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
